@@ -1,0 +1,28 @@
+node_modules/
+dist/
+.cache/
+
+# Local AI runtimes and models that are too large for GitHub.
+tools/align/venv/
+tools/whisper-cuda/
+*.bin
+*.onnx
+*.safetensors
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
+
+# Logs and operating-system files.
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files.
+.idea/
+.vscode/
