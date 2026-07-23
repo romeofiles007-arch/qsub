@@ -19,12 +19,17 @@ import {
   registerInRoot,
   US,
 } from "./capcut.mjs";
+import { createJanitor } from "./storage.mjs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 
 const app = express();
-const root = path.join(os.tmpdir(), "silence-studio-local");
+// Scratch lives on the system drive by default. Point SILENCE_SCRATCH_DIR at a
+// roomier disk if C: is tight — analysis writes several GB per clip.
+const root =
+  process.env.SILENCE_SCRATCH_DIR?.trim() ||
+  path.join(os.tmpdir(), "silence-studio-local");
 const hyperframesCli = path.resolve(
   "node_modules",
   "hyperframes",
@@ -147,6 +152,69 @@ const upload = multer({
   limits: { fileSize: 8 * 1024 * 1024 * 1024 },
 });
 const jobs = new Map();
+const capcutDraftRoot = path.join(
+  os.homedir(),
+  "AppData",
+  "Local",
+  "CapCut",
+  "User Data",
+  "Projects",
+  "com.lveditor.draft",
+);
+// A CapCut draft stores an absolute path to its source media, so any upload one
+// links to has stopped being scratch. Exports pin their own sources, but drafts
+// made before that existed — or after a lost manifest — are found by scanning.
+async function capcutSourcesInUse() {
+  const found = new Set();
+  const prefix = path.resolve(root).toLowerCase();
+  const scratchName = path.basename(root).toLowerCase();
+  // Walk parsed JSON rather than regexing the text: CapCut writes Windows paths
+  // with escaped backslashes, and the parser already handles that for us.
+  const collect = (node) => {
+    if (typeof node === "string") {
+      // Cheap reject first: a draft holds thousands of strings, almost none of
+      // which are paths.
+      if (!node.toLowerCase().includes(scratchName)) return;
+      try {
+        const resolved = path.resolve(node);
+        if (resolved.toLowerCase().startsWith(prefix)) found.add(resolved);
+      } catch {
+        // Not a usable path.
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const child of node) collect(child);
+      return;
+    }
+    if (node && typeof node === "object")
+      for (const child of Object.values(node)) collect(child);
+  };
+  let drafts = [];
+  try {
+    drafts = await readdir(capcutDraftRoot, { withFileTypes: true });
+  } catch {
+    return []; // CapCut not installed, or no drafts yet.
+  }
+  for (const draft of drafts) {
+    if (!draft.isDirectory()) continue;
+    for (const name of ["draft_content.json", "draft_meta_info.json"]) {
+      try {
+        collect(
+          JSON.parse(
+            await readFile(path.join(capcutDraftRoot, draft.name, name), "utf8"),
+          ),
+        );
+      } catch {
+        // Missing or half-written draft file — nothing to adopt from it.
+      }
+    }
+  }
+  return [...found];
+}
+// The scratch folder is temporary by definition: sweep it on boot, on a timer,
+// and on exit so uploads can never pile up and choke the system drive.
+const janitor = createJanitor({ root, jobs, adopt: capcutSourcesInUse });
 app.use(express.json({ limit: "2mb" }));
 
 // Detect an NVIDIA GPU once at startup.
@@ -452,17 +520,28 @@ app.get("/api/health", async (_, res) => {
     gpu: gpuAvailable,
     gpuReady: gpuAvailable && (await has(whisperCliGpu)),
     alignReady: await alignerReady(),
+    storage: await janitor.stats(),
   });
 });
-app.post("/api/analyze", upload.single("media"), async (req, res) => {
+// Manual trigger, mostly for "why is my disk full" moments.
+app.post("/api/storage/sweep", async (_, res) => {
+  const result = await janitor.sweep();
+  res.json({ ...result, storage: await janitor.stats() });
+});
+app.post("/api/analyze", upload.single("media"), janitor.guardUpload, async (req, res) => {
+  let target = "";
   try {
     if (!req.file) throw new Error("ไม่พบไฟล์");
     const id = crypto.randomUUID();
     const ext = path.extname(req.file.originalname) || ".mp4";
-    const target = req.file.path + ext;
+    target = req.file.path + ext;
     await import("node:fs/promises").then((fs) =>
       fs.rename(req.file.path, target),
     );
+    // Hold the renamed path before releasing the multer one, so the file is
+    // never unprotected between the two names.
+    janitor.holdUpload(target);
+    janitor.releaseUpload(req.file.path);
     const threshold = req.body.threshold || "-30dB";
     const min = req.body.minSilence || "0.45";
     const padding = Math.max(0, Number(req.body.padding || 0.15));
@@ -537,6 +616,8 @@ app.post("/api/analyze", upload.single("media"), async (req, res) => {
       duration,
       silences,
       keepSegments,
+      createdAt: Date.now(),
+      lastUsed: Date.now(),
     });
     res.json({
       id,
@@ -550,12 +631,17 @@ app.post("/api/analyze", upload.single("media"), async (req, res) => {
       name: req.file.originalname,
       noiseReduce,
     });
+    // The job entry now keeps the file alive; the upload hold can go.
+    janitor.releaseUpload(target);
   } catch (e) {
+    // Nothing will ever reference this upload — do not let it linger.
+    janitor.releaseUpload(target, req.file?.path);
+    void janitor.discard(target, req.file?.path);
     res.status(500).json({ error: e.message });
   }
 });
 app.post("/api/transcribe/:id", async (req, res) => {
-  const job = jobs.get(req.params.id);
+  const job = janitor.touch(req.params.id);
   if (!job)
     return res.status(404).json({ error: "ไม่พบงาน กรุณาวิเคราะห์ไฟล์ใหม่" });
   const dir = path.join(root, req.params.id);
@@ -697,7 +783,7 @@ app.post("/api/transcribe/:id", async (req, res) => {
   }
 });
 app.post("/api/transcribe-eleven/:id", async (req, res) => {
-  const job = jobs.get(req.params.id);
+  const job = janitor.touch(req.params.id);
   if (!job)
     return res.status(404).json({ error: "ไม่พบงาน กรุณาวิเคราะห์ไฟล์ใหม่" });
   const apiKey = String(req.body.apiKey || "").trim();
@@ -781,7 +867,7 @@ app.post("/api/transcribe-eleven/:id", async (req, res) => {
   }
 });
 app.post("/api/export-cut/:id", async (req, res) => {
-  const job = jobs.get(req.params.id);
+  const job = janitor.touch(req.params.id);
   if (!job)
     return res.status(404).json({ error: "ไม่พบงาน กรุณาวิเคราะห์ไฟล์ใหม่" });
   const ranges = (req.body.silences || [])
@@ -866,6 +952,8 @@ app.post("/api/export-cut/:id", async (req, res) => {
       output,
     ]);
     const base = path.parse(job.name).name.replace(/[\\/:*?"<>|]/g, "-");
+    // The browser owns the file once it has been saved; the render is scratch.
+    janitor.dropAfterSend(res, output);
     res.download(output, `${base}-export.mp4`);
   } catch (e) {
     res.status(500).json({ error: `ตัดวิดีโอไม่สำเร็จ: ${e.message}` });
@@ -890,7 +978,7 @@ app.post("/api/export-srt", async (req, res) => {
     .send(srt);
 });
 app.post("/api/export-capcut/:id", async (req, res) => {
-  const job = jobs.get(req.params.id);
+  const job = janitor.touch(req.params.id);
   if (!job)
     return res.status(404).json({ error: "ไม่พบงาน กรุณาวิเคราะห์ไฟล์ใหม่" });
   try {
@@ -898,7 +986,7 @@ app.post("/api/export-capcut/:id", async (req, res) => {
       ? req.body.sources
       : [];
     const sourceJobs = requestedSources.length
-      ? requestedSources.map((source) => jobs.get(String(source.jobId || "")))
+      ? requestedSources.map((source) => janitor.touch(String(source.jobId || "")))
       : [job];
     if (sourceJobs.some((source) => !source))
       return res.status(404).json({ error: "ไฟล์ต้นฉบับบางก้อนไม่พร้อม กรุณาวิเคราะห์ Media ใหม่" });
@@ -950,15 +1038,7 @@ app.post("/api/export-capcut/:id", async (req, res) => {
       hasAudio: true,
     }));
 
-    const draftRoot = path.join(
-      os.homedir(),
-      "AppData",
-      "Local",
-      "CapCut",
-      "User Data",
-      "Projects",
-      "com.lveditor.draft",
-    );
+    const draftRoot = capcutDraftRoot;
     const { contentRef, textRef } = await findTemplates(draftRoot, "0722");
 
     const baseName = path
@@ -1086,6 +1166,13 @@ app.post("/api/export-capcut/:id", async (req, res) => {
       // Registration is best-effort; CapCut usually rescans the folder anyway.
     }
 
+    // The draft stores absolute paths into the scratch folder, so these source
+    // files stop being disposable the moment CapCut links to them.
+    await janitor.pin(
+      sourceJobs.map((source) => source.file),
+      projectName,
+    );
+
     res.json({
       project: projectName,
       folder: foldPath,
@@ -1102,6 +1189,7 @@ app.post("/api/export-capcut/:id", async (req, res) => {
       .json({ error: `สร้าง CapCut draft ไม่สำเร็จ: ${e.message}` });
   }
 });
+await janitor.start();
 app.listen(5174, "127.0.0.1", () =>
   console.log("Local media API http://127.0.0.1:5174"),
 );
