@@ -684,7 +684,13 @@ function App() {
       totalDuration += itemDuration;
       const source = mediaWaveforms[mediaId] || [];
       const targetBins = Math.max(1, Math.round(itemDuration * 240));
-      combined.push(...resampleWaveform(source, targetBins));
+      // Copy bin by bin. Spreading into push() passes every bin as a separate
+      // function argument, which overflows the stack past ~124k of them — only
+      // about 8.5 minutes at 240 bins per second. A single longer clip used to
+      // throw here, and because this runs in an effect React tore the whole
+      // editor down and left a black screen.
+      const bins = resampleWaveform(source, targetBins);
+      for (let index = 0; index < bins.length; index++) combined.push(bins[index]);
     }
     if (combined.length) setPeaks(combined);
     if (totalDuration > 0) setSourceDuration(totalDuration);
@@ -772,9 +778,16 @@ function App() {
   const mediaOccupancy = timelineMedia.length
     ? Math.min(1, Math.max(0.28, timelineMedia.length * 0.28))
     : 1;
-  const timelineDisplayDuration = Math.max(
-    duration,
-    duration / Math.max(0.01, mediaOccupancy),
+  // Everything on the timeline — ruler ticks, widths, waveform bins — is
+  // derived from this, and several of those allocate arrays from it. One
+  // non-finite value anywhere upstream would throw RangeError mid-render and
+  // unmount the editor, so it gets clamped once, here, rather than at each use.
+  const timelineDisplayDuration = Math.min(
+    24 * 3600,
+    Math.max(
+      0.001,
+      Math.max(duration, duration / Math.max(0.01, mediaOccupancy)) || 0.001,
+    ),
   );
   const occupiedPercent = (duration / timelineDisplayDuration) * 100;
   const px = Math.max(96, timelineDisplayDuration * 72 * zoom);
@@ -3092,7 +3105,15 @@ function App() {
                       return;
                     }
                     if (timelineMedia.length) return;
-                    const nextDuration = e.currentTarget.duration || 15;
+                    // duration reads back as Infinity for files that carry no
+                    // length in their metadata (fragmented MP4, some WebM, a
+                    // recording still being written). Infinity is truthy, so
+                    // `|| 15` let it through and the ruler below then tried to
+                    // allocate an infinite array, which takes the whole app
+                    // down. The media bin already guards this the same way.
+                    const probed = e.currentTarget.duration;
+                    const nextDuration =
+                      Number.isFinite(probed) && probed > 0 ? probed : 15;
                     setSourceDuration(nextDuration);
                     setDuration(nextDuration);
                     setZoom(
@@ -4135,7 +4156,15 @@ function App() {
             >
               <div className="ruler">
                 {Array.from(
-                  { length: Math.floor(timelineDisplayDuration / rulerStep) + 1 },
+                  {
+                    // rulerStep already spaces labels ~64px apart, so a sane
+                    // timeline never needs many ticks. Capping the count keeps
+                    // a bad duration from allocating an unrenderable array.
+                    length: Math.min(
+                      2000,
+                      Math.floor(timelineDisplayDuration / rulerStep) + 1,
+                    ),
+                  },
                   (_, i) => {
                     const t = i * rulerStep;
                     return (
